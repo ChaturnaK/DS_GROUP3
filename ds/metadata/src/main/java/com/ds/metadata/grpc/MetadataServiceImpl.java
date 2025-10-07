@@ -1,8 +1,10 @@
 package com.ds.metadata.grpc;
 
+import com.ds.common.Metrics;
 import com.ds.metadata.MetaStore;
 import com.ds.metadata.PlacementService;
 import com.ds.metadata.ZkCoordinator;
+import com.ds.time.ClusterClock;
 import ds.Ack;
 import ds.BlockPlan;
 import ds.CommitBlock;
@@ -12,16 +14,23 @@ import ds.LocateResp;
 import ds.MetadataServiceGrpc;
 import ds.PlanPutReq;
 import ds.PlanPutResp;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
+import io.micrometer.core.instrument.Timer;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImplBase {
+  private static final Logger log = LoggerFactory.getLogger(MetadataServiceImpl.class);
+
   private final MetaStore meta;
   private final PlacementService placement;
   private final ZkCoordinator coord;
+  private final Timer commitTimer = Metrics.timer("consensus_commit_latency");
 
   public MetadataServiceImpl(MetaStore meta, PlacementService placement, ZkCoordinator coord) {
     this.meta = meta;
@@ -33,9 +42,10 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
   public void planPut(PlanPutReq req, StreamObserver<PlanPutResp> respObs) {
     if (!coord.isLeader()) {
       respObs.onError(
-          io.grpc.Status.FAILED_PRECONDITION
-              .withDescription("Not leader")
-              .asRuntimeException());
+          Status.FAILED_PRECONDITION.withDescription("Not leader").asRuntimeException());
+      return;
+    }
+    if (!ensureEpoch(respObs, "planPut")) {
       return;
     }
     try {
@@ -56,8 +66,7 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
       respObs.onNext(resp);
       respObs.onCompleted();
     } catch (Exception e) {
-      respObs.onError(
-          io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+      respObs.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
     }
   }
 
@@ -65,15 +74,18 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
   public void commit(CommitReq req, StreamObserver<Ack> respObs) {
     if (!coord.isLeader()) {
       respObs.onError(
-          io.grpc.Status.FAILED_PRECONDITION
-              .withDescription("Not leader")
-              .asRuntimeException());
+          Status.FAILED_PRECONDITION.withDescription("Not leader").asRuntimeException());
       return;
     }
+    if (!ensureEpoch(respObs, "commit")) {
+      return;
+    }
+    Timer.Sample sample = Timer.start(Metrics.reg());
     try {
       MetaStore.FileEntry fe = new MetaStore.FileEntry();
       fe.size = req.getSize();
-      fe.ctime = fe.mtime = System.currentTimeMillis();
+      long now = ClusterClock.now();
+      fe.ctime = fe.mtime = now;
       List<String> blockIds = new ArrayList<>();
       Map<String, MetaStore.BlockEntry> bes = new HashMap<>();
       for (CommitBlock cb : req.getBlocksList()) {
@@ -96,8 +108,9 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
       respObs.onNext(Ack.newBuilder().setOk(true).setMsg("committed").build());
       respObs.onCompleted();
     } catch (Exception e) {
-      respObs.onError(
-          io.grpc.Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+      respObs.onError(Status.INTERNAL.withDescription(e.getMessage()).asRuntimeException());
+    } finally {
+      sample.stop(commitTimer);
     }
   }
 
@@ -118,8 +131,25 @@ public class MetadataServiceImpl extends MetadataServiceGrpc.MetadataServiceImpl
       respObs.onNext(resp);
       respObs.onCompleted();
     } catch (Exception e) {
-      respObs.onError(
-          io.grpc.Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
+      respObs.onError(Status.NOT_FOUND.withDescription(e.getMessage()).asRuntimeException());
     }
+  }
+
+  private boolean ensureEpoch(StreamObserver<?> respObs, String operation) {
+    long published = coord.fetchPublishedEpoch();
+    long local = coord.getLeaderEpoch();
+    if (published != 0 && local != 0 && published != local) {
+      log.warn(
+          "[CONSENSUS] {} rejected due to epoch mismatch (local={}, remote={})",
+          operation,
+          local,
+          published);
+      respObs.onError(
+          Status.FAILED_PRECONDITION
+              .withDescription("Stale leader detected, aborting write")
+              .asRuntimeException());
+      return false;
+    }
+    return true;
   }
 }

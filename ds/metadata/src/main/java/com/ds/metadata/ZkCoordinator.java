@@ -1,5 +1,6 @@
 package com.ds.metadata;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
@@ -8,6 +9,7 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.recipes.leader.LeaderLatch;
 import org.apache.curator.framework.recipes.leader.LeaderLatchListener;
 import org.apache.curator.retry.ExponentialBackoffRetry;
+import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.Watcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -20,6 +22,8 @@ public class ZkCoordinator implements AutoCloseable {
   private static final String STORAGE_NODES_PATH = "/ds/nodes/storage";
   private static final String LEADER_PATH = "/ds/metadata/leader";
   private final List<Consumer<Boolean>> leaderListeners = new CopyOnWriteArrayList<>();
+  private volatile long currentEpoch;
+  private volatile String lastEndpoint = "";
 
   public ZkCoordinator(String zk, String id) throws Exception {
     this.client =
@@ -27,16 +31,19 @@ public class ZkCoordinator implements AutoCloseable {
     this.client.start();
     this.client.blockUntilConnected();
     this.leaderLatch = new LeaderLatch(client, "/ds/metadata/leader", id);
+    this.currentEpoch = readEpochFromZk();
     this.leaderLatch.addListener(
         new LeaderLatchListener() {
           @Override
           public void isLeader() {
+            advanceEpoch();
             log.info("Leadership granted for {}", id);
             notifyLeaderListeners(true);
           }
 
           @Override
           public void notLeader() {
+            refreshEpochFromZk();
             log.info("Leadership revoked for {}", id);
             notifyLeaderListeners(false);
           }
@@ -54,25 +61,113 @@ public class ZkCoordinator implements AutoCloseable {
   }
 
   public void publishLeaderEndpoint(String endpoint) {
+    lastEndpoint = endpoint == null ? "" : endpoint;
     try {
-      if (client.checkExists().forPath(LEADER_PATH) == null) {
-        client.create().creatingParentsIfNeeded().forPath(LEADER_PATH, endpoint.getBytes());
-      } else {
-        client.setData().forPath(LEADER_PATH, endpoint.getBytes());
-      }
+      writeLeaderInfo(lastEndpoint, currentEpoch);
+    } catch (Exception e) {
+      log.warn("Failed to publish leader endpoint {}: {}", endpoint, e.toString());
+    }
+  }
+
+  public void publishLeaderEndpoint(String endpoint, long epoch) {
+    lastEndpoint = endpoint == null ? "" : endpoint;
+    currentEpoch = Math.max(currentEpoch, epoch);
+    try {
+      writeLeaderInfo(lastEndpoint, currentEpoch);
     } catch (Exception e) {
       log.warn("Failed to publish leader endpoint {}: {}", endpoint, e.toString());
     }
   }
 
   public void clearLeaderEndpoint() {
+    lastEndpoint = "";
     try {
-      if (client.checkExists().forPath(LEADER_PATH) != null) {
-        client.setData().forPath(LEADER_PATH, new byte[0]);
-      }
+      writeLeaderInfo("", currentEpoch);
     } catch (Exception e) {
       log.warn("Failed to clear leader endpoint: {}", e.toString());
     }
+  }
+
+  public synchronized long getLeaderEpoch() {
+    return currentEpoch;
+  }
+
+  public synchronized long fetchPublishedEpoch() {
+    long epoch = readEpochFromZk();
+    if (epoch > currentEpoch) {
+      currentEpoch = epoch;
+    }
+    return epoch;
+  }
+
+  private synchronized void writeLeaderInfo(String endpoint, long epoch) throws Exception {
+    String payload = formatPayload(endpoint, epoch);
+    if (client.checkExists().forPath(LEADER_PATH) == null) {
+      client
+          .create()
+          .creatingParentsIfNeeded()
+          .forPath(LEADER_PATH, payload.getBytes(StandardCharsets.UTF_8));
+    } else {
+      client.setData().forPath(LEADER_PATH, payload.getBytes(StandardCharsets.UTF_8));
+    }
+  }
+
+  private synchronized void advanceEpoch() {
+    long zkEpoch = readEpochFromZk();
+    long next = Math.max(Math.max(zkEpoch + 1, currentEpoch + 1), 1);
+    currentEpoch = next;
+    log.info("[CONSENSUS] Leader switched to epoch={}", currentEpoch);
+    try {
+      writeLeaderInfo(lastEndpoint, currentEpoch);
+    } catch (Exception e) {
+      log.warn("Failed to update leader info for epoch {}: {}", currentEpoch, e.toString());
+    }
+  }
+
+  private synchronized void refreshEpochFromZk() {
+    long zkEpoch = readEpochFromZk();
+    if (zkEpoch > currentEpoch) {
+      currentEpoch = zkEpoch;
+    }
+  }
+
+  private long readEpochFromZk() {
+    try {
+      if (client.checkExists().forPath(LEADER_PATH) == null) {
+        return currentEpoch;
+      }
+      byte[] data = client.getData().forPath(LEADER_PATH);
+      return parseEpoch(data);
+    } catch (KeeperException.NoNodeException e) {
+      return currentEpoch;
+    } catch (Exception e) {
+      log.warn("Failed to read leader epoch: {}", e.toString());
+      return currentEpoch;
+    }
+  }
+
+  private static long parseEpoch(byte[] data) {
+    if (data == null || data.length == 0) {
+      return 0L;
+    }
+    String payload = new String(data, StandardCharsets.UTF_8).trim();
+    if (payload.isEmpty()) {
+      return 0L;
+    }
+    int idx = payload.lastIndexOf(':');
+    if (idx < 0 || idx == payload.length() - 1) {
+      return 0L;
+    }
+    try {
+      return Long.parseLong(payload.substring(idx + 1));
+    } catch (NumberFormatException e) {
+      return 0L;
+    }
+  }
+
+  private static String formatPayload(String endpoint, long epoch) {
+    String safeEndpoint = endpoint == null ? "" : endpoint;
+    return safeEndpoint + ":" + epoch;
   }
 
   public void addLeadershipListener(Consumer<Boolean> listener) {

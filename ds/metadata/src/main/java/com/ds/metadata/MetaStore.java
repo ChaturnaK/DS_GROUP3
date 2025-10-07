@@ -4,13 +4,15 @@ import com.ds.common.JsonSerde;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import org.apache.curator.framework.CuratorFramework;
-import org.apache.curator.framework.api.transaction.CuratorTransactionFinal;
+import org.apache.curator.framework.api.transaction.CuratorOp;
 import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.data.Stat;
 
 public class MetaStore {
   public static final String FILES = "/ds/meta/files";
@@ -54,11 +56,7 @@ public class MetaStore {
   public void putFile(String path, FileEntry fe) throws Exception {
     String p = FILES + "/" + esc(path);
     byte[] payload = JsonSerde.write(fe);
-    try {
-      zk.create().creatingParentsIfNeeded().forPath(p, payload);
-    } catch (KeeperException.NodeExistsException e) {
-      zk.setData().forPath(p, payload);
-    }
+    upsertWithCas(p, payload);
   }
 
   public Optional<FileEntry> getFile(String path) throws Exception {
@@ -72,11 +70,7 @@ public class MetaStore {
   public void putBlock(String blockId, BlockEntry be) throws Exception {
     String p = BLOCKS + "/" + esc(blockId);
     byte[] payload = JsonSerde.write(be);
-    try {
-      zk.create().creatingParentsIfNeeded().forPath(p, payload);
-    } catch (KeeperException.NodeExistsException e) {
-      zk.setData().forPath(p, payload);
-    }
+    upsertWithCas(p, payload);
   }
 
   public Optional<BlockEntry> getBlock(String blockId) throws Exception {
@@ -90,44 +84,153 @@ public class MetaStore {
   public void commit(String path, FileEntry fe, Map<String, BlockEntry> blocks) throws Exception {
     String fp = FILES + "/" + esc(path);
     byte[] fbytes = JsonSerde.write(fe);
-    if (zk.checkExists().forPath(fp) != null) {
-      FileEntry cur = JsonSerde.read(zk.getData().forPath(fp), FileEntry.class);
-      boolean identical = Objects.equals(cur.blocks, fe.blocks) && cur.size == fe.size;
-      if (identical) {
-        boolean blocksIdentical = true;
-    for (Map.Entry<String, BlockEntry> entry : blocks.entrySet()) {
+    int attempts = 0;
+    while (true) {
+      attempts++;
+      Stat fileStat = new Stat();
+      boolean fileExists = false;
+      FileEntry currentFile = null;
+      try {
+        byte[] existingFile = zk.getData().storingStatIn(fileStat).forPath(fp);
+        fileExists = true;
+        currentFile = JsonSerde.read(existingFile, FileEntry.class);
+      } catch (KeeperException.NoNodeException ignore) {
+        fileStat = null;
+      }
+
+      Map<String, Stat> blockStats = new HashMap<>();
+      Map<String, byte[]> blockPayloads = new HashMap<>();
+      boolean identical = fileExists
+          && Objects.equals(currentFile.blocks, fe.blocks)
+          && currentFile.size == fe.size;
+      boolean blocksIdentical = identical;
+
+      for (Map.Entry<String, BlockEntry> entry : blocks.entrySet()) {
+        String bp = BLOCKS + "/" + esc(entry.getKey());
+        byte[] payload = JsonSerde.write(entry.getValue());
+        blockPayloads.put(bp, payload);
+        Stat blockStat = new Stat();
+        try {
+          byte[] existingBlock = zk.getData().storingStatIn(blockStat).forPath(bp);
+          blockStats.put(bp, blockStat);
+          if (blocksIdentical) {
+            BlockEntry existing = JsonSerde.read(existingBlock, BlockEntry.class);
+            if (!Objects.equals(existing.replicas, entry.getValue().replicas)
+                || existing.size != entry.getValue().size) {
+              blocksIdentical = false;
+            }
+          }
+        } catch (KeeperException.NoNodeException e) {
+          blockStats.put(bp, null);
+          blocksIdentical = false;
+        }
+      }
+
+      if (identical && blocksIdentical) {
+        return;
+      }
+
+      try {
+        List<CuratorOp> ops = new ArrayList<>();
+        ops.add(zk.transactionOp().check().forPath(FILES));
+        if (!fileExists) {
+          ops.add(zk.transactionOp().create().forPath(fp, fbytes));
+        } else {
+          ops.add(
+              zk.transactionOp()
+                  .setData()
+                  .withVersion(fileStat.getVersion())
+                  .forPath(fp, fbytes));
+        }
+        for (Map.Entry<String, BlockEntry> entry : blocks.entrySet()) {
           String bp = BLOCKS + "/" + esc(entry.getKey());
-          if (zk.checkExists().forPath(bp) == null) {
-            blocksIdentical = false;
-            break;
-          }
-          BlockEntry existing = JsonSerde.read(zk.getData().forPath(bp), BlockEntry.class);
-          if (!Objects.equals(existing.replicas, entry.getValue().replicas)
-              || existing.size != entry.getValue().size) {
-            blocksIdentical = false;
-            break;
+          byte[] payload = blockPayloads.get(bp);
+          Stat stat = blockStats.get(bp);
+          if (stat == null) {
+            ops.add(zk.transactionOp().create().forPath(bp, payload));
+          } else {
+            ops.add(
+                zk.transactionOp()
+                    .setData()
+                    .withVersion(stat.getVersion())
+                    .forPath(bp, payload));
           }
         }
-        if (blocksIdentical) {
+        zk.transaction().forOperations(ops);
+        return;
+      } catch (KeeperException.BadVersionException | KeeperException.NodeExistsException e) {
+        if (attempts >= 5) {
+          throw e;
+        }
+      } catch (Exception e) {
+        if ((isBadVersion(e) || isNodeExists(e)) && attempts < 5) {
+          continue;
+        }
+        throw e;
+      }
+    }
+  }
+
+  private void upsertWithCas(String path, byte[] payload) throws Exception {
+    int attempts = 0;
+    while (attempts++ < 10) {
+      if (zk.checkExists().forPath(path) == null) {
+        try {
+          CuratorOp create = zk.transactionOp().create().forPath(path, payload);
+          zk.transaction().forOperations(create);
           return;
+        } catch (KeeperException.NodeExistsException e) {
+          // Retry with fresh state
+        } catch (Exception e) {
+          if (isNodeExists(e)) {
+            continue;
+          }
+          throw e;
+        }
+      } else {
+        Stat stat = new Stat();
+        try {
+          zk.getData().storingStatIn(stat).forPath(path);
+        } catch (KeeperException.NoNodeException e) {
+          continue;
+        }
+        try {
+          CuratorOp set =
+              zk.transactionOp()
+                  .setData()
+                  .withVersion(stat.getVersion())
+                  .forPath(path, payload);
+          zk.transaction().forOperations(set);
+          return;
+        } catch (KeeperException.BadVersionException e) {
+          // retry
+        } catch (Exception e) {
+          if (isBadVersion(e)) {
+            continue;
+          }
+          throw e;
         }
       }
     }
-    CuratorTransactionFinal tx = zk.inTransaction().check().forPath(FILES).and();
-    if (zk.checkExists().forPath(fp) == null) {
-      tx = tx.create().forPath(fp, fbytes).and();
-    } else {
-      tx = tx.setData().forPath(fp, fbytes).and();
-    }
-    for (Map.Entry<String, BlockEntry> e : blocks.entrySet()) {
-      String bp = BLOCKS + "/" + esc(e.getKey());
-      byte[] bbytes = JsonSerde.write(e.getValue());
-      if (zk.checkExists().forPath(bp) == null) {
-        tx = tx.create().forPath(bp, bbytes).and();
-      } else {
-        tx = tx.setData().forPath(bp, bbytes).and();
+    throw KeeperException.create(KeeperException.Code.BADVERSION);
+  }
+
+  private static boolean isBadVersion(Exception e) {
+    return causedBy(e, KeeperException.BadVersionException.class);
+  }
+
+  private static boolean isNodeExists(Exception e) {
+    return causedBy(e, KeeperException.NodeExistsException.class);
+  }
+
+  private static boolean causedBy(Throwable throwable, Class<? extends KeeperException> type) {
+    Throwable current = throwable;
+    while (current != null) {
+      if (type.isInstance(current)) {
+        return true;
       }
+      current = current.getCause();
     }
-    tx.commit();
+    return false;
   }
 }
