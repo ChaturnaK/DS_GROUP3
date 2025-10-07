@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package ds;
+
+option java_package = "ds";
+option java_multiple_files = true;
+
+message FilePath { string path = 1; }
+message PlanPutReq { string path = 1; int64 size = 2; int32 chunkSize = 3; }
+message BlockPlan { string blockId = 1; repeated string replicaUrls = 2; int64 size = 3; }
+message PlanPutResp { repeated BlockPlan blocks = 1; }
+message LocateResp { repeated BlockPlan blocks = 1; int64 size = 2; }
+message CommitBlock { string blockId = 1; int64 size = 2; repeated string replicas = 3; }
+message CommitReq { string path = 1; int64 size = 2; repeated CommitBlock blocks = 3; }
+message Ack { bool ok = 1; string msg = 2; }
+
+service MetadataService {
+  rpc PlanPut(PlanPutReq) returns (PlanPutResp);
+  rpc Locate(FilePath) returns (LocateResp);
+  rpc Commit(CommitReq) returns (Ack);
+}
+
+message PutAck { bool ok = 1; string checksum = 2; string msg = 3; }
+message GetHdr { string blockId = 1; int32 minR = 2; }
+message BlockChunk { bytes data = 1; }
+message GetMeta { string vectorClock = 1; string checksum = 2; }
+
+message PutOpen {
+  string blockId = 1;
+  string vectorClock = 2;
+  string clientId = 3;
+  int64 size = 4;
+}
+
+message PutRequest {
+  oneof payload {
+    PutOpen open = 1;
+    BlockChunk chunk = 2;
+  }
+}
+
+message GetResponse {
+  oneof payload {
+    GetMeta meta = 1;
+    BlockChunk chunk = 2;
+  }
+}
+
+service StorageService {
+  rpc PutBlock(stream PutRequest) returns (PutAck);
+  rpc GetBlock(GetHdr) returns (stream GetResponse);
+  rpc ReplicateBlock(GetHdr) returns (Ack);
+}

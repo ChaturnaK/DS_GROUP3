@@ -1,0 +1,6 @@
+/common/   @memberB @memberC @memberD
+/metadata/ @memberD @memberA
+/storage/  @memberB @memberA
+/client/   @memberB @memberD
+/time/     @memberC
+/scripts/  @memberA @memberC @memberD

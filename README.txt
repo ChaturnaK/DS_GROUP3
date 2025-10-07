@@ -1,0 +1,7 @@
+GROUP MEMBERS
+1. NONIS P.K.D.T. 			- IT23614130 - IT23614130@my.sliit.lk
+2. JAYASINGHE S.H.D		    - IT23736764 - IT23736764@my.sliit.lk
+3. KASTURIRATNA K.T.A.C.S.	- IT23537392 - IT23537392@my.sliit.lk
+4. MEDDEGAMA B.T.M.R.N.B. 	- IT23655652 - IT23655652@my.sliit.lk
+
+RUN e2e-test.sh from ds/scripts
